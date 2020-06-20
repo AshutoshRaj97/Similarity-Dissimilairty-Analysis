@@ -1,0 +1,1222 @@
+import sys
+from collections import defaultdict
+import operator
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from sklearn.cluster import DBSCAN
+import matplotlib.image as mpimg 
+from scipy.spatial import distance
+from mpl_toolkits.mplot3d import Axes3D
+import math
+
+
+"""Defnitions and initializations of parameters"""
+
+#difference threshold
+d_thresh = 0.9
+
+
+#Geometry_1
+lam_1 = 0.9989 #parameter in calculatd_thresing the mixed distance (defining the encompassing elipsoid volume curvature for node extraction)
+                #for a geometry with one overall dimension larger than others, use lesser value of lam)
+R_1 = 50 #R = resolution parameter(more the value of R, more number of graph node points are extracted)
+tau_1 = 0.001  #distance parameter to say if two point clouds are connected or not(lesser the value of tau, lesser the no. of edges in graph)
+
+#Geometry_2
+lam_2 = 0.9989 #parameter in calculating the mixed distance (defining the encompassing elipsoid volume curvature for node extraction)
+                #for a geometry with one overall dimension larger than others, use lesser value of lam)
+R_2 = 50 #R = resolution parameter(more the value of R, more number of graph node points are extracted)
+tau_2 = 0.001 #distance parameter to say if two point clouds are connected or not(lesser the value of tau, lesser the no. of edges in graph) 
+
+file_1 = "data_obj_files/1A.obj"
+file_2 = "data_obj_files/1B.obj"  
+plot_name_1 = 'plots/geometry_1'
+plot_name_2 = 'plots/geometry_2'
+similarity_plot_name = 'plots/similarity_plot'
+dissimilar_region_plot_name = 'plots/dissimilar_region_plot'
+
+"""----------------------------------------------"""
+
+
+class objeto():
+    def __init__(self, obj = None):
+        if obj:
+            self.cargar_obj(obj)
+
+    def cargar_obj(self, archivo):
+        with open(archivo, 'r') as obj:
+            datos = obj.read()
+
+        lineas = datos.splitlines()
+        self.vertices = []
+        self.vertices_normal = []
+        self.superficies = []
+
+        for linea in lineas:
+            elem = linea.split()
+            if elem:
+                if elem[0] == 'v':
+                    v = (float(elem[1]), float(elem[2]), float(elem[3]))
+                    self.vertices.append(v)
+
+                elif elem[0] == 'vn':
+                    vn = (float(elem[1]), float(elem[2]), float(elem[3]))  
+                    self.vertices_normal.append(vn)  
+                elif elem[0] == 'f':
+                    f = []
+                    for i in range(1, len(elem)):
+                        [int(e) for e in elem[i].replace('//','/').split('/')]
+                        [int(e) for e in elem[i].split('/') if e]  
+                else:
+                    pass
+#end of the class
+
+
+
+#PAPER: Reeb graph path dissimilarity for 3D object matching and retrieval
+
+"""Calculating the centroid of the whole body"""
+def get_centroid(vert_set):
+    #Finding the centroid of the points in the vert_set
+    x_sum = 0
+    y_sum = 0
+    z_sum = 0
+    num_vertices = len(vert_set)
+
+    for i in range(num_vertices):
+        x_sum = vert_set[i][0] + x_sum
+        y_sum = vert_set[i][1] + y_sum
+        z_sum = vert_set[i][2] + z_sum 
+
+    centroid_subeset = (x_sum/num_vertices,y_sum/num_vertices,z_sum/num_vertices) #centroid
+    
+    return(centroid_subeset)
+
+
+"""Calculating the Affine Matrix"""
+def calculate_affine_mat(centroid, vertices_set):
+    num_vertices = len(vertices_set)  #number of vertices (m)
+    vertices_set = np.asmatrix(vertices_set)
+    centroid = np.asmatrix(centroid)
+    
+    #centering the vertices wrt the centroid of whole mesh i.e. making centroid as the origin
+    #finding V_c from V
+    vertices_set = vertices_set - centroid
+    vertices_set_T = vertices_set.transpose()
+
+    #Affine_mat  = m {{(V_c)**T} {V_c}}**inverse 
+    #matrix multiplication: {{(V_c)**T} {V_c}}
+    multiplied_mat = np.dot(vertices_set_T,vertices_set)
+
+    #matrix inversion: {{(V_c)**T} {V_c}}**inverse
+    inverted_mat = np.linalg.inv(multiplied_mat)
+    #finding affine matrix Aff_mat  
+    Aff_mat = num_vertices*(inverted_mat)
+
+    return(Aff_mat)
+
+# aff_mat = calculate_affine_mat(c,obj_class.vertices)
+# print(aff_mat)
+
+"""Function for getting data dependent value of lambda"""
+def calculate_lam_data(centroid, vertices_set, aff_mat): #calculates data dependent value of lambda parameter
+
+    num_vertices = len(vertices_set)  #number of vertices (m)
+
+    vertices_set = np.asmatrix(vertices_set)
+    centroid = np.asmatrix(centroid)
+   
+    ##AFFINE DISTANCE
+
+    #implementing ||p-c||_aff**2  = {(p-c)**T} {Affine_mat} {(p-c)}
+    #p is a single point
+    #however, we do it for all the points at one go
+    #c is the centroid of the whole point cloud
+    #m = number of vertices
+
+    #||p-c||**2  =  {(p-c)} {Affine_mat} {(p-c)**T} 
+    #here p is a single point (vector)
+    #however, we do it for all the points at one go
+    temp = vertices_set - centroid
+
+    temp = np.asmatrix(temp)
+    #matrix multiplication
+    aff_dist_temp = np.dot(temp,aff_mat)
+    #element wise product (Hadamard Product)
+    aff_dist = np.multiply(aff_dist_temp,temp)
+    # print(aff_dist) 
+    aff_dist = np.sum(aff_dist,axis = 1)
+    # print(len(aff_dist))
+    # print("Affine distance: ", aff_dist)
+  
+
+    ##EUCLIDEAN DISTANCE
+    #implementing ||p-c||**2 = {(p-c)**T} {(p-c)}
+    temp = vertices_set - centroid
+    euc_dist = np.multiply(temp,temp)
+    euc_dist =np.sum(euc_dist,axis = 1)
+    # print("Eucledian Dist:",(euc_dist))
+ 
+    lam_data = max(euc_dist/(euc_dist+aff_dist))
+    
+    return(lam_data)
+
+
+"""Functions for getting distance"""
+
+def calculate_mixed_dist(centroid, vertices_set, aff_mat, lam): #gives the mixed distance of a point from the centroid of the whole body 
+
+    num_vertices = len(vertices_set)  #number of vertices (m)
+
+    vertices_set = np.asmatrix(vertices_set)
+    centroid = np.asmatrix(centroid)
+   
+    ##AFFINE DISTANCE
+
+    #implementing ||p-c||_aff**2  = {(p-c)**T} {Affine_mat} {(p-c)}
+    #p is a single point
+    #however, we do it for all the points at one go
+    #c is the centroid of the whole point cloud
+    #m = number of vertices
+
+    #||p-c||**2  =  {(p-c)} {Affine_mat} {(p-c)**T} 
+    #here p is a single point (vector)
+    #however, we do it for all the points at one go
+    temp = vertices_set - centroid
+
+    temp = np.asmatrix(temp)
+    #matrix multiplication
+    aff_dist_temp = np.dot(temp,aff_mat)
+    #element wise product (Hadamard Product)
+    aff_dist = np.multiply(aff_dist_temp,temp)
+    # print(aff_dist) 
+    aff_dist = np.sum(aff_dist,axis = 1)
+    # print(len(aff_dist))
+    # print("Affine distance: ", aff_dist)
+  
+
+    ##EUCLIDEAN DISTANCE
+    #implementing ||p-c||**2 = {(p-c)**T} {(p-c)}
+    temp = vertices_set - centroid
+    euc_dist = np.multiply(temp,temp)
+    euc_dist =np.sum(euc_dist,axis = 1)
+    # print("Eucledian Dist:",(euc_dist))
+ 
+    
+    ##MIXED DISTANCE
+    mixed_dist = lam*(euc_dist) + (1-lam)*(aff_dist)
+    # print("Mixed Distance: ", mixed_dist)
+    
+    return(mixed_dist)
+
+
+
+
+
+def get_dist(k,R,max_dist): #to set the enclosing volumes (eg. two concentric spheres)
+    return(k*max_dist/R)
+
+
+
+# A Python program for Dijkstra's shortest  
+# path algorithm for adjacency 
+# list representation of graph 
+
+sys.setrecursionlimit(100000000)
+class Heap():
+  
+    def __init__(self): 
+        self.array = [] 
+        self.size = 0
+        self.pos = [] 
+  
+    def newMinHeapNode(self, v, dist): 
+        minHeapNode = [v, dist] 
+        return minHeapNode 
+  
+    # A utility function to swap two nodes  
+    # of min heap. Needed for min heapify 
+    def swapMinHeapNode(self,a, b): 
+        t = self.array[a] 
+        self.array[a] = self.array[b] 
+        self.array[b] = t 
+  
+    # A standard function to heapify at given idx 
+    # This function also updates position of nodes  
+    # when they are swapped.Position is needed  
+    # for decreaseKey() 
+    def minHeapify(self, idx): 
+        smallest = idx 
+        left = 2*idx + 1
+        right = 2*idx + 2
+  
+        if left < self.size and self.array[left][1] < self.array[smallest][1]: 
+            smallest = left 
+  
+        if right < self.size and self.array[right][1] < self.array[smallest][1]: 
+            smallest = right 
+  
+        # The nodes to be swapped in min  
+        # heap if idx is not smallest 
+        if smallest != idx: 
+  
+            # Swap positions 
+            self.pos[ self.array[smallest][0] ] = idx 
+            self.pos[ self.array[idx][0] ] = smallest 
+  
+            # Swap nodes 
+            self.swapMinHeapNode(smallest, idx) 
+  
+            self.minHeapify(smallest) 
+  
+    # Standard function to extract minimum  
+    # node from heap 
+    def extractMin(self): 
+  
+        # Return NULL wif heap is empty 
+        if self.isEmpty() == True: 
+            return
+  
+        # Store the root node 
+        root = self.array[0] 
+  
+        # Replace root node with last node 
+        lastNode = self.array[self.size - 1] 
+        self.array[0] = lastNode 
+  
+        # Update position of last node 
+        self.pos[lastNode[0]] = 0
+        self.pos[root[0]] = self.size - 1
+  
+        # Reduce heap size and heapify root 
+        self.size -= 1
+        self.minHeapify(0) 
+  
+        return root 
+  
+    def isEmpty(self): 
+        return True if self.size == 0 else False
+  
+    def decreaseKey(self, v, dist): 
+  
+        # Get the index of v in  heap array 
+  
+        i = self.pos[v] 
+  
+        # Get the node and update its dist value 
+        self.array[i][1] = dist 
+  
+        # Travel up while the complete tree is  
+        # not hepified. This is a O(Logn) loop 
+        while i > 0 and self.array[i][1] < self.array[(i - 1) // 2][1]: 
+  
+            # Swap this node with its parent 
+            self.pos[ self.array[i][0] ] = (i-1)//2
+            self.pos[ self.array[(i-1)//2][0] ] = i 
+            self.swapMinHeapNode(i, (i - 1)//2 ) 
+  
+            # move to parent index 
+            i = (i - 1) // 2; 
+  
+    # A utility function to check if a given  
+    # vertex 'v' is in min heap or not 
+
+    def isInMinHeap(self, v): 
+        # print(v)
+        if self.pos[v] < self.size: 
+            return True
+        return False
+ 
+
+  
+class Graph(): 
+    
+    dist_mat = [] #for storing the min distances for every node to every endpoint
+    
+  
+    def __init__(self, V): 
+        self.V = V 
+        self.graph = defaultdict(list) 
+        
+  
+    # Adds an edge to an undirected graph 
+    def addEdge(self, src, dest, weight): 
+  
+        # Add an edge from src to dest.  A new node  
+        # is added to the adjacency list of src. The  
+        # node is added at the beginning. The first  
+        # element of the node has the destination  
+        # and the second elements has the weight 
+        newNode = [dest, weight] 
+        self.graph[src].insert(0, newNode) 
+        # Since graph is undirected, add an edge  
+        # from dest to src also 
+        newNode = [src, weight] 
+        self.graph[dest].insert(0, newNode) 
+    def DFSUtil(self, temp, v, visited): 
+  
+        # Mark the current vertex as visited 
+        visited[v] = True
+  
+        # Store the vertex to list 
+        temp.append(v) 
+        # Repeat for all vertices adjacent 
+        # to this vertex v 
+        for i,j in self.graph[v]: 
+            if visited[i] == False: 
+                # Update the list 
+                temp = self.DFSUtil(temp, i, visited) 
+        return temp
+
+    # Method to retrieve connected components 
+    # in an undirected graph 
+    def connectedComponents(self): 
+        visited = [] 
+        cc = [] 
+        for i in range(self.V): 
+            visited.append(False) 
+        for v in range(self.V): 
+            if visited[v] == False: 
+                temp = [] 
+                cc.append(self.DFSUtil(temp, v, visited)) 
+        return cc 
+    
+                    
+                    
+  
+    # The main function that calulates distances  
+    # of shortest paths from src to all vertices.  
+    # It is a O(ELogV) function 
+    def dijkstra(self, src): 
+  
+        V = self.V  # Get the number of vertices in graph 
+        dist = []   # dist values used to pick minimum  
+                    # weight edge in cut
+        
+        # minHeap represents set E 
+        minHeap = Heap() 
+  
+        #  Initialize min heap with all vertices.  
+        # dist value of all vertices 
+        for v in range(V): 
+            dist.append(sys.maxsize) 
+            minHeap.array.append( minHeap.newMinHeapNode(v, dist[v]) ) 
+            minHeap.pos.append(v) 
+  
+        # Make dist value of src vertex as 0 so  
+        # that it is extracted first 
+        minHeap.pos[src] = src 
+        dist[src] = 0
+        minHeap.decreaseKey(src, dist[src]) 
+  
+        # Initially size of min heap is equal to V 
+        minHeap.size = V; 
+
+        # In the following loop, min heap contains all nodes 
+        # whose shortest distance is not yet finalized. 
+        while minHeap.isEmpty() == False: 
+  
+            # Extract the vertex with minimum distance value 
+            newHeapNode = minHeap.extractMin() 
+            u = newHeapNode[0] 
+  
+            # Traverse through all adjacent vertices of  
+            # u (the extracted vertex) and update their  
+            # distance values 
+            for pCrawl in self.graph[u]: 
+  
+                v = pCrawl[0] 
+  
+                # If shortest distance to v is not finalized  
+                # yet, and distance to v through u is less  
+                # than its previously calculated distance 
+                if minHeap.isInMinHeap(v) and dist[u] != sys.maxsize and pCrawl[1] + dist[u] < dist[v]: 
+                        dist[v] = pCrawl[1] + dist[u] 
+  
+                        # update distance value  
+                        # in min heap also 
+                        minHeap.decreaseKey(v, dist[v]) 
+  
+        #append the distance list to the list of lists dist_mat
+        Graph.dist_mat.append(dist)
+#         print("Length of dist_mat",len(Graph.dist_mat))
+
+
+"""Function to calculate the sum of the min distances of each node from every endpoint"""
+
+def calculate_dist(dist_mat):
+    res = np.sum(dist_mat, 0)
+#     print("After summing",len(dist_mat))
+    return(res)
+
+
+"""functions for Plots"""
+def plot_one_geometry(vert_mat_plt, max_subgraph_endpoints_plt,max_connected_node_identifier_plt, plot_name,R,lam,tau):
+    
+    fig = plt.figure(figsize=(40,20))
+    
+    #GEOMETRY 1
+    ax = fig.add_subplot(121, projection='3d')
+    
+    # node_mat = np.asmatrix((node_set_ID.values())))
+    x_points = vert_mat_plt[:,0]
+    y_points = vert_mat_plt[:,1]
+    z_points = vert_mat_plt[:,2]
+    
+    # #plots all points in point cloud
+    # point_cloud = ax.scatter(x_points,y_points,z_points, c='b',alpha = 0.01)
+    
+    #plots all the centroids, even the non-connected ones
+    # for value in node_set_ID.values():
+        # ax.scatter(value[0],value[1],value[2], c='r',s = 200)
+    
+    #plotting edges
+    # for i in range(len(max_subgraph_connections)):
+        # ax.plot([node_set[i][0],node_set[i+1][0]],[node_set[i][1],node_set[i+1][1]], [node_set[i][2],node_set[i+1][2]], c='r')
+        # ax.plot([max_subgraph_connections[i][0][0],max_subgraph_connections[i][1][0]],[max_subgraph_connections[i][0][1],max_subgraph_connections[i][1][1]], [max_subgraph_connections[i][0][2],max_subgraph_connections[i][1][2]], c='g')
+    # ax.scatter(c[0], c[1], c[2], s=200)
+
+    #plotting endpoints
+    # count_1 = 1
+    # for i in (max_subgraph_endpoints_plt):
+    #     for key,value in max_connected_node_identifier_plt.items():
+    #         if(value == i):
+    #             endpoint_plot = ax.scatter(key[0],key[1],key[2], s = 100, c='r')
+    # print("Endpoints:", len(max_subgraph_endpoints_plt))
+    
+    #plotting nodes
+    for key,value in max_connected_node_identifier_plt.items():
+        node_plot= ax.scatter(key[0],key[1],key[2], s = 100, c='r')
+    
+    # print("Nodes:", len(max_connected_node_identifier_plt))
+     
+    
+    # print(max_subgraph_endpoints_plt)
+    num_endpoints = len(max_subgraph_endpoints_plt)
+#     ax.set_title("Geometry with extracted graph node endpoints",fontsize = 40)
+    # plt.title('Number of endpoints in the extracted Graph: {}'.format(num_endpoints), fontsize=20)
+    
+    plt.title('Number of nodes in the extracted Graph: {}'.format(len(max_connected_node_identifier_plt)), fontsize=20)
+    plt.suptitle('R = {}  Lambda = {}  Tau = {}'.format(R,lam,tau), fontsize=20)
+    ax.legend((point_cloud, node_plot),("point cloud","Extracted graph nodes"),loc = 'lower right')
+    # ax.legend((node_plot),("Extracted graph nodes"),loc = 'lower right')
+    fig.savefig(plot_name + '.png', bbox_inches='tight')#save the figure to file
+#     plt.show()
+    return()
+    
+    
+def plot_two_geometries(vert_mat_1, max_subgraph_endpoints_1,max_connected_node_identifier_1,vert_mat_2,\
+                        max_subgraph_endpoints_2,max_connected_node_identifier_2,similarity_indx):
+ 
+    fig = plt.figure(figsize=(40,20))
+    
+    #GEOMETRY 1
+    ax = fig.add_subplot(121, projection='3d')
+    
+    # node_mat = np.asmatrix((node_set_ID.values())))
+    x_points = vert_mat_1[:,0]
+    y_points = vert_mat_1[:,1]
+    z_points = vert_mat_1[:,2]
+    
+    # #plots all points in point cloud
+    ax.scatter(x_points,y_points,z_points, c='b',alpha = 0.1)
+    
+    #plots all the centroids, even the non-connected ones
+    # for value in node_set_ID.values():
+        # ax.scatter(value[0],value[1],value[2], c='r',s = 200)
+    
+    #plotting edges
+    # for i in range(len(max_subgraph_connections)):
+        # ax.plot([node_set[i][0],node_set[i+1][0]],[node_set[i][1],node_set[i+1][1]], [node_set[i][2],node_set[i+1][2]], c='r')
+        # ax.plot([max_subgraph_connections[i][0][0],max_subgraph_connections[i][1][0]],[max_subgraph_connections[i][0][1],max_subgraph_connections[i][1][1]], [max_subgraph_connections[i][0][2],max_subgraph_connections[i][1][2]], c='g')
+    # ax.scatter(c[0], c[1], c[2], s=200)
+
+    #plotting endpoints
+    # for i in (max_subgraph_endpoints_1):
+    #     for key,value in max_connected_node_identifier_1.items():
+    #         if(value == i):
+    #             ax.scatter(key[0],key[1],key[2], s = 100, c='r')
+
+    
+    #plotting nodes
+    for key,value in max_connected_node_identifier_1.items():
+        ax.scatter(key[0],key[1],key[2], s = 100, c='r')
+            
+            
+    #GEOMETRY 2
+    
+    #  fig = plt.figure(figsize=(10,10))
+    ax = fig.add_subplot(122, projection='3d')
+    
+    # # ax = fig.add_subplot(122, projection='3d')
+    # # node_mat = np.asmatrix((node_set_ID.values())))
+    x_points = vert_mat_2[:,0]
+    y_points = vert_mat_2[:,1]
+    z_points = vert_mat_2[:,2]
+    
+    # #plots all points in point cloud
+    ax.scatter(x_points,y_points,z_points, c='b',alpha = 0.1)
+    
+    # #plots all the centroids, even the non-connected ones
+    # # for value in node_set_ID.values():
+    #     # ax.scatter(value[0],value[1],value[2], c='r',s = 200)
+    
+    # #plotting edges
+    # for i in range(len(max_subgraph_connections)):
+        # ax.plot([node_set[i][0],node_set[i+1][0]],[node_set[i][1],node_set[i+1][1]], [node_set[i][2],node_set[i+1][2]], c='r')
+        # ax.plot([max_subgraph_connections[i][0][0],max_subgraph_connections[i][1][0]],[max_subgraph_connections[i][0][1],max_subgraph_connections[i][1][1]], [max_subgraph_connections[i][0][2],max_subgraph_connections[i][1][2]], c='g')
+    # # ax.scatter(c[0], c[1], c[2], s=200)
+
+    #plotting endpoints
+    # for i in (max_subgraph_endpoints_2):
+    #     for key,value in max_connected_node_identifier_2.items():
+    #         if(value == i):
+    #             ax.scatter(key[0],key[1],key[2], s = 100, c='r')
+
+    #plotting nodes
+    for key,value in max_connected_node_identifier_2.items():
+        ax.scatter(key[0],key[1],key[2], s = 100, c='r')
+     
+
+    fig.suptitle("Similarity Score: {} ".format(similarity_indx) ,fontsize = 30)
+    
+     
+    fig.savefig(similarity_plot_name + '.png' ,bbox_inches='tight')#save the figure to file
+#     plt.show()
+    return()
+   
+
+"""Function to plot dissimilar regions of the geometries"""
+def plot_dis_sim_nodes(vert_mat_1, max_subgraph_endpoints_1,max_connected_node_identifier_1,vert_mat_2,\
+            max_subgraph_endpoints_2,max_connected_node_identifier_2,similarity_indx,dis_sim_nodes_1,dis_sim_nodes_2,d_thresh,\
+            point_arr_ID_1,node_set_ID_1,point_arr_ID_2,node_set_ID_2):
+ 
+    
+    #geting points for dissimilar regions of GEOMETRY 1
+    point_holder_1 = []
+    temp_key_holder_1 = []
+
+    for dis_node in dis_sim_nodes_1:
+        for key_1,value_1 in node_set_ID_1.items():
+            if(dis_node == value_1):
+                temp_key_holder_1.append(key_1)
+            
+        
+    for temp_key in temp_key_holder_1:
+        for key_1,value_1 in point_arr_ID_1.items():
+            if(temp_key == key_1):
+                point_holder_1.append(value_1)
+       
+    point_holder_1 = np.array(point_holder_1)
+    point_holder_1 = point_holder_1.flatten()
+    
+ 
+    #geting points for dissimilar regions of GEOMETRY 2
+    point_holder_2 = []
+    temp_key_holder_2 = []
+
+    for dis_node in dis_sim_nodes_2:
+        for key_2,value_2 in node_set_ID_2.items():
+            if(dis_node == value_2):
+                temp_key_holder_2.append(key_2)
+            
+        
+    for temp_key in temp_key_holder_2:
+        for key_2,value_2 in point_arr_ID_2.items():
+            if(temp_key == key_2):
+                point_holder_2.append(value_2)
+       
+    # print(temp_key_holder_1)
+    # print(point_holder_2)
+    point_holder_2 = np.array(point_holder_2)
+    point_holder_2 = point_holder_2.flatten()
+    
+    
+            
+    fig = plt.figure(figsize=(40,20))
+    
+    #GEOMETRY 1
+    ax = fig.add_subplot(121, projection='3d')
+    
+    # node_mat = np.asmatrix((node_set_ID.values())))
+    x_points = vert_mat_1[:,0]
+    y_points = vert_mat_1[:,1]
+    z_points = vert_mat_1[:,2]
+    
+    # #plots all points in point cloud
+    # ax.scatter(x_points,y_points,z_points, c='b',alpha = 0.01)
+    
+    #plots all the centroids, even the non-connected ones
+    # for value in node_set_ID.values():
+        # ax.scatter(value[0],value[1],value[2], c='r',s = 200)
+    
+    
+    #plotting dis_sim nodes
+    # for x,y,z in dis_sim_nodes_1:
+        # ax.scatter(x,y,z, s = 100, c='r')
+        
+    #plotting diff points
+    for temp_point_set in (point_holder_1):
+        for x,y,z in temp_point_set:
+            ax.scatter(x,y,z, c='g',alpha = 1)
+        
+            
+            
+    #GEOMETRY 2
+    
+    #  fig = plt.figure(figsize=(10,10))
+    ax = fig.add_subplot(122, projection='3d')
+    
+    # # ax = fig.add_subplot(122, projection='3d')
+    # # node_mat = np.asmatrix((node_set_ID.values())))
+    x_points = vert_mat_2[:,0]
+    y_points = vert_mat_2[:,1]
+    z_points = vert_mat_2[:,2]
+    
+    # #plots all points in point cloud
+    # ax.scatter(x_points,y_points,z_points, c='b',alpha = 0.01)
+    
+    # #plots all the centroids, even the non-connected ones
+    # # for value in node_set_ID.values():
+    #     # ax.scatter(value[0],value[1],value[2], c='r',s = 200)
+    
+    #plotting dis_sim nodes
+    # for x,y,z in dis_sim_nodes_2:
+        # ax.scatter(x,y,z, s = 100, c='r')
+        
+    #plotting diff points
+    for temp_point_set in (point_holder_2):
+        for x,y,z in temp_point_set:
+            ax.scatter(x,y,z, c='g',alpha = 1)
+            
+    
+    fig.suptitle("Dissimilarity threshold given: {} ".format(d_thresh) ,fontsize = 30)
+    
+     
+    fig.savefig(dissimilar_region_plot_name + '.png' ,bbox_inches='tight')#save the figure to file
+#     plt.show()
+    return()
+
+
+
+"""Function to extract graph"""
+
+def extract_graph(file_1, lam, R, tau, plot_name):
+    obj_class = objeto()
+    obj_class.cargar_obj(file_1)
+    vert_mat = np.asmatrix(obj_class.vertices)#point cloud
+    node_set = [] #set of the points in the graph
+    
+    
+    #Finding the centroid of the 3D mesh
+#     print(len(obj_class.vertices))
+    c = get_centroid(obj_class.vertices)
+    d = c + (0,)
+    e = d + (0,)
+    # print(c)
+    node_set.append(e)
+    # print(node_set)
+    
+    #calculate affine matrix
+    aff_mat = calculate_affine_mat(c,obj_class.vertices)
+    
+    """Getting the data dependent value of the lamda parameter lam_data"""
+    lam_data = calculate_lam_data(c,obj_class.vertices,aff_mat)
+    print(lam_data)
+    
+    
+    """Finding maximum mixed distance between centroid of the body and any point"""
+    #Finding the maximum distance of a point from the centroid
+    
+    max_dist = max(calculate_mixed_dist(c,obj_class.vertices, aff_mat,lam))
+    # print(max_dist)
+    min_dist = min(calculate_mixed_dist(c,obj_class.vertices, aff_mat,lam))
+    # print(min_dist)
+    
+    #bins (lower lim, upper lim) in which we need to group points
+    bins = np.zeros(R+1)
+    for k in range(0,R+1):
+        bins[k] = (k*max_dist)/R
+    # print(bins)
+    
+    #finding bin_number of points corresponding to the bin they belong to
+    #bin_num here starts from 1,2,3,... (basically denotes the bin number)
+    dist_array  =  calculate_mixed_dist(c,obj_class.vertices, aff_mat,lam)
+    # print(dist_array)
+    bin_num = np.digitize(dist_array, bins)
+    
+    
+    #calculating the centroid of the points in different bins
+    # prnt(np.unique(bin_num))
+    # print(len((np.where(bin_num == 1)[0])))
+    bin_num = np.asarray(bin_num)
+    vert_array = np.asarray(obj_class.vertices, dtype=tuple)
+    graph_connections = []
+    #required for checking connectedness
+    temp_count = 0
+    
+    point_arr_ID = {}
+    node_set_ID = {}
+    
+    #adding centroid of the whole geometry to the node set dict
+    centroid_ID_temp = {(0,0):c}
+    node_set_ID.update(centroid_ID_temp)
+    
+    
+    #iterating over bins
+    for i in range(len(np.unique(bin_num))):
+    
+        #required for DBScan
+        uniq_clust_list = []
+    
+        curr_bin_num = i+1
+        ind_bin = np.where(bin_num == curr_bin_num)
+     
+        point_arr = np.take(vert_array,ind_bin,axis=0)
+       
+        #reshaping to get correct dimensions (m x 3)
+        point_arr = point_arr[0]
+        # print("volume bin",point_arr.shape)
+    
+        if(len(point_arr) != 0):
+    
+            #implementing DBscan to find connectedness for the points
+            clustering = DBSCAN(eps=1, min_samples=5).fit(point_arr)
+            uniq_clust_list = np.unique(clustering.labels_)
+    
+            # print(np.unique(clustering.labels_))
+            for j in range(len(uniq_clust_list)):
+                      
+                ind_clust = np.where(clustering.labels_ == uniq_clust_list[j])
+                point_arr_clust = np.take(point_arr,ind_clust,axis=0)
+                point_arr_clust = point_arr_clust[0]
+                # print("Cluster shape:",point_arr_clust.shape)
+    
+                #appending the cluster ID and volume bin ID to the points
+                #point_arr_ID  is a dict with key as (clust_ID, vol_bin_ID)
+                point_arr_ID_temp = {(uniq_clust_list[j], curr_bin_num):point_arr_clust}
+                point_arr_ID.update(point_arr_ID_temp)
+                # print("Dictionary of clustered points:", point_arr_ID)
+    
+                #calculating the centroid of the connected components     
+                centroid = get_centroid(point_arr_clust)
+    
+                if(centroid not in node_set_ID.values()):
+                    #storing the next centroid in the node_set
+                    temp_centroid_ID = {(uniq_clust_list[j], curr_bin_num):centroid}
+                    node_set_ID.update(temp_centroid_ID)
+                    # print("Dictionary of node points of the graph:", node_set_ID)
+            
+    
+            if(len(node_set_ID) >= 2 and temp_count >= 1): #when there are atleast 2 nodes to find distance between and the current volume                                                            bin number is atleast the second one with points  
+                #finding the previous bin number 
+                flag = 0
+                temp_prev_bin = curr_bin_num - 0.1 
+                while(flag != 1):
+                    if(math.floor(temp_prev_bin) in (np.unique(bin_num))):
+                        prev_bin_num = math.floor(temp_prev_bin)
+                        flag = 1
+                    else:
+                        temp_prev_bin = temp_prev_bin - 1   
+    
+                if temp_count == 1 :
+                #appending all the nodes in the volume bin just after the centroid (of the whole geometry) to the centroid (of the whole                   geometry)
+                    for y in prev_uniq_clust_list:
+                        graph_connections.append([c,node_set_ID.get((y,prev_bin_num))])
+                     
+    
+                #checking connectedness using dict 
+                #checking connectedness between the clusters of current volume bin with the clusters in the prev volume bin (not between                   clusters within a volume bin)
+                #iterating over all unique clusters of consecutive volume bins
+                for t in (uniq_clust_list): #current volume bin clusters
+                    for p in (prev_uniq_clust_list): #prev volume bin clusters
+                        curr_points_arr_clust = point_arr_ID.get((t,curr_bin_num))
+                        prev_points_arr_clust = point_arr_ID.get((p,prev_bin_num))
+                        # print("curr_bin: ", curr_bin_num)
+                        # print("prev_bin: ", prev_bin_num)
+                        # print("clust number in curr bin: ", t)
+                        # print("clust number in prev bin : ", p)
+                        # print("points in clust in curr bin : ", len(curr_points_arr_clust))
+                        # print("points in clust in prev bin : ", len(prev_points_arr_clust))
+                        # print(curr_points_arr_clust)
+                        # print(distance.cdist(prev_points_arr_clust, curr_points_arr_clust))
+                        
+                        if((min(distance.cdist(prev_points_arr_clust, curr_points_arr_clust).min(axis = 1)) <= (tau*max_dist))):                                   #comparison based on the threshold for min dist between the clusters of the consecutive vol bins
+                        #getting the nodes corresponding to the p^th and t^th clusters in the volume bins satisfying above condition 
+                            node_point_1 = node_set_ID.get((t,curr_bin_num))
+                            node_point_2 = node_set_ID.get((p,prev_bin_num))  
+                            #appending the connections as a tuple of node points (prev_node, cur_node)
+                            graph_connections.append([node_point_2,node_point_1])                
+    
+            #outside latest if
+            temp_count = temp_count + 1
+            prev_uniq_clust_list = uniq_clust_list
+            prev_point_arr_bin = point_arr
+            
+            
+    ##finding the endpoint of the graph 
+    node_degree = {} 
+    node_identifier = {} #stores a unique index to refer to each node in the graph
+    identifier = 0 #iterates for identity #identity start from 0
+    
+    for i in range(len(graph_connections)):
+        # print(graph_connections[0][0])
+        # print(graph_connections[0][1])
+        if(graph_connections[i][0] not in node_degree):
+            node_temp = {graph_connections[i][0]: 1}
+            node_degree.update(node_temp)
+        else:
+            node_degree[graph_connections[i][0]] = node_degree[graph_connections[i][0]] + 1 
+        
+        if(graph_connections[i][1] not in node_degree):
+            node_temp = {graph_connections[i][1]: 1}
+            node_degree.update(node_temp)
+        else:
+            node_degree[graph_connections[i][1]] = node_degree[graph_connections[i][1]] + 1
+    
+        #identifiers for nodes
+    
+        if(graph_connections[i][0] not in node_identifier):
+            node_temp_iden = {graph_connections[i][0]: identifier}
+            node_identifier.update(node_temp_iden)
+            identifier = identifier + 1
+     
+        if(graph_connections[i][1] not in node_identifier):
+            node_temp_iden = {graph_connections[i][1]: identifier}
+            node_identifier.update(node_temp_iden)
+            identifier = identifier + 1
+       
+    #endpoints for the net_graph
+    count = 0
+    endpoints = []
+    for z,w in node_degree.items():
+        if(w == 1):
+            count = count + 1 
+            endpoints.append(node_identifier[z])
+            
+            
+            
+            
+    #n is the total number of nodes
+    n = len(node_set_ID)
+    # print(n)
+    net_graph = Graph(n) 
+    
+    #making the net graph by adding edges
+    for i in range(len(graph_connections)):
+        edge_weight=(calculate_mixed_dist(graph_connections[i][0], graph_connections[i][1], aff_mat, lam)-min_dist)/(max_dist-min_dist)
+        net_graph.addEdge(node_identifier[graph_connections[i][0]],node_identifier[graph_connections[i][1]],edge_weight)
+
+    #finding connected components in the net graph and selecting only the largest connected component (one with max nodes)
+    cc = net_graph.connectedComponents() 
+    
+    temp_max_len = len(cc[0])
+    for t in range(len(cc)):
+        if(temp_max_len <= len(cc[t])):
+            temp_max_len = len(cc[t])
+            pos_max_len = t
+    
+    #list of nodes (node_identifiers which correspond to the max len conected graph component)
+    max_connected_graph_nodes = cc[pos_max_len] 
+
+    
+    
+    max_connected_node_identifier = {} #nodes_identifiers corresponding to the nodes of max connected subgraph 
+    # count = 0
+    temp_identifier = 0
+    max_subgraph_connections = [] #stores the max subgraph connections
+    
+    for w in max_connected_graph_nodes :
+        for key,value in node_identifier.items():
+            
+            if(value == w) :
+                if(key not in max_connected_node_identifier): 
+                    node_temp_iden = {key:temp_identifier} #Renumbering the nodes in the extracted max subgraph
+                    max_connected_node_identifier.update(node_temp_iden)
+                    temp_identifier = temp_identifier + 1
+
+                   
+                    
+    for key,values in max_connected_node_identifier.items():
+        
+        for i in range(len(graph_connections)):
+            
+            if(graph_connections[i][0] == key or graph_connections[i][1] == key):
+                if(graph_connections[i] not in max_subgraph_connections):
+                    max_subgraph_connections.append([graph_connections[i][0],graph_connections[i][1]])
+                
+                
+                
+                
+
+    #now we only deal with the max connected subgraph
+    m = len(max_connected_graph_nodes) #nodes in the max connected subgraph
+    # print(m)
+    max_subgraph = Graph(m)
+    
+    #making the max  graph by adding edges
+    for i in range(len(max_subgraph_connections)):
+        edge_weight=(calculate_mixed_dist(max_subgraph_connections[i][0],max_subgraph_connections[i][1], \
+                     aff_mat,lam)-min_dist)/(max_dist-min_dist)
+        max_subgraph.addEdge(max_connected_node_identifier[max_subgraph_connections[i][0]] \
+                            ,max_connected_node_identifier[max_subgraph_connections[i][1]],edge_weight)
+
+    ##finding the endpoints of the max connected subgraph 
+    max_subgraph_node_degree = {} 
+    
+    for i in range(len(max_subgraph_connections)):
+        # print(graph_connections[0][0])
+        # print(graph_connections[0][1])
+        if(max_subgraph_connections[i][0] not in max_subgraph_node_degree):
+            max_subgraph_node_temp = {max_subgraph_connections[i][0]: 1}
+            max_subgraph_node_degree.update(max_subgraph_node_temp)
+        else:
+            max_subgraph_node_degree[max_subgraph_connections[i][0]] = max_subgraph_node_degree[max_subgraph_connections[i][0]] + 1 
+        
+        if(max_subgraph_connections[i][1] not in max_subgraph_node_degree):
+            max_subgraph_node_temp = {max_subgraph_connections[i][1]: 1}
+            max_subgraph_node_degree.update(max_subgraph_node_temp)
+        else:
+            max_subgraph_node_degree[max_subgraph_connections[i][1]] = max_subgraph_node_degree[max_subgraph_connections[i][1]] + 1
+    
+    
+    #endpoints for the max_subgraph
+    count = 0
+    max_subgraph_endpoints = []
+    for z,w in max_subgraph_node_degree.items():
+        if(w == 1):
+            count = count + 1 
+            max_subgraph_endpoints.append(max_connected_node_identifier[z])
+    # print(count)
+    # print(max_subgraph_endpoints)
+    
+    #for storing the feature for every node
+    average= [0] * len(max_connected_graph_nodes)
+    node_features = {}
+    
+    #making features for the nodes
+    
+    for i in range(len(max_subgraph_endpoints)):
+#         print("Endpoint", max_subgraph_endpoints[i])
+        max_subgraph.dijkstra(max_subgraph_endpoints[i])
+    
+    if(len(Graph.dist_mat) <= 1):
+        #clearing the Graph.dist_mat matrix 
+        Graph.dist_mat.clear()
+        print("Graph not extracted!")
+        print("Enter suitable set of parameter values!")
+        print("Aborted!")
+        return
+    
+    dist_sum = calculate_dist(Graph.dist_mat) #sums up the minimum dist of all nodes from all endpoints    
+#     print(len(max_subgraph_endpoints))
+    for i in range(len(average)):
+#         print(dist_sum[i])
+        average[i] = dist_sum[i]/len(max_subgraph_endpoints)
+#         print(average[i])
+        temp_features = {i:average[i]}
+        node_features.update(temp_features) #dict to store the nodes and their features
+    
+    #clearing the Graph.dist_mat matrix 
+    Graph.dist_mat.clear()
+        
+        
+    endpoint_dict = {}
+    #creating separate dict for endpoints
+    for i in (max_subgraph_endpoints):
+        for key,value in (max_connected_node_identifier.items()):
+            if(value == i):
+                temp_endpoint = {key:value}
+                endpoint_dict.update(temp_endpoint)
+    # print(len(endpoint_dict))
+    
+    #plot of geometry
+    #plot is saved in the png file in a plots folder 
+    plot_one_geometry(vert_mat, max_subgraph_endpoints,max_connected_node_identifier,plot_name,R,lam,tau)
+ 
+    return(node_features,max_subgraph_endpoints,max_connected_node_identifier,vert_mat,point_arr_ID,node_set_ID,endpoint_dict)
+ 
+    
+    
+"""Comparison"""
+
+#we need to compare with respect to the features of the nodes of graphs pertaining to both geometries
+#method 1 ENDPOINT FEATURE comparison
+#incomplete comparison  -- since endpoints differ in number for the two graphs
+def similarity_score(file_1, lam_1, R_1, tau_1, file_2, lam_2, R_2, tau_2):
+    
+    #function call for graph extraction of geometry 1
+    node_features_1,max_subgraph_endpoints_1,max_connected_node_identifier_1,vert_mat_1,point_arr_ID_1,node_set_ID_1,\
+    endpoint_dict_1= extract_graph(file_1,lam_1,R_1,tau_1,plot_name_1)
+    
+    # print(point_arr_ID_1)
+    # print(node_set_ID_1)
+    # print(node_features_1)
+    # print(max_connected_node_identifier_1)
+
+    
+    #function call for graph extraction of geometry 2
+    node_features_2,max_subgraph_endpoints_2,max_connected_node_identifier_2,vert_mat_2,point_arr_ID_2,node_set_ID_2,\
+    endpoint_dict_2= extract_graph(file_2,lam_2,R_2,tau_2,plot_name_2)
+    
+    
+    
+    #making a dict with endpoint features for geometry 1
+    endpoint_features_1 = {}
+    for key_1, val_1 in endpoint_dict_1.items():
+       temporary_endpoint_1 = {key_1:(node_features_1[val_1])}
+       endpoint_features_1.update(temporary_endpoint_1)
+
+    #making a dict with endpoint features for geometry 2
+    endpoint_features_2 = {}
+    for key_2, val_2 in endpoint_dict_2.items():
+       temporary_endpoint_2 = {key_2:(node_features_2[val_2])}
+       endpoint_features_2.update(temporary_endpoint_2)
+       
+       
+    #making a dict with max connected node features for geometry 1
+    max_connected_node_features_1 = {}
+    for key_1, val_1 in max_connected_node_identifier_1.items():
+       temporary_node_1 = {key_1:(node_features_1[val_1])}
+       max_connected_node_features_1.update(temporary_node_1)
+
+    #making a dict with max connected node features for geometry 1
+    max_connected_node_features_2 = {}
+    for key_2, val_2 in max_connected_node_identifier_2.items():
+       temporary_node_2 = {key_2:(node_features_2[val_2])}
+       max_connected_node_features_2.update(temporary_node_2) 
+       
+    # print(max_connected_node_features_1)
+    # print(max_connected_node_features_2)
+
+          
+    #comparing un-equal lengthed lists 
+    # if len(endpoint_dict_2) > len(endpoint_dict_1):
+    #     loop_length = len(endpoint_dict_1)
+    # else:
+    #     loop_length = len(endpoint_dict_2)
+        
+    #comparing un-equal lengthed lists (node features)
+    if len(max_connected_node_identifier_2) > len(max_connected_node_identifier_1):
+        loop_length = len(max_connected_node_identifier_1)
+        larger_list = 2
+    else:
+        loop_length = len(max_connected_node_identifier_2)
+        larger_list = 1
+    
+    #sorting the endpoint_features of both geometries in ascending order of the feature values
+    #returns a tuple list arranged in asc order
+    sorted_endpoint_features_1 = sorted(endpoint_features_1.items(), key=operator.itemgetter(1))
+    sorted_endpoint_features_2 = sorted(endpoint_features_2.items(), key=operator.itemgetter(1))
+    # print(sorted_endpoint_features_1)
+    
+    #sorting the endpoint_features of both geometries in ascending order of the feature values
+    #returns a tuple list arranged in asc order
+    sorted_node_features_1 = sorted(max_connected_node_features_1.items(), key=operator.itemgetter(1))
+    sorted_node_features_2 = sorted(max_connected_node_features_2.items(), key=operator.itemgetter(1))
+    # print(sorted_endpoint_features_1)
+    
+    #pointwise dissimilarty for endpoints
+    # point_wise_diff = []
+    # # point_wise_diff = abs((sorted_endpoint_features_1)-(sorted_endpoint_features_2))
+    # for i in range(loop_length):
+    #     point_wise_diff.append((abs(abs(sorted_endpoint_features_1[i][1]) - abs(sorted_endpoint_features_2[i][1])))\
+    #     /(max(abs(sorted_endpoint_features_1[i][1]),abs(sorted_endpoint_features_2[i][1]))))
+    
+        
+    #pointwise dissimilarty for nodes
+    point_wise_diff = []
+    
+    #also finding region of dissimilarity
+    dis_sim_nodes_1 = []
+    dis_sim_nodes_2 = []
+    
+    # point_wise_diff = abs((sorted_endpoint_features_1)-(sorted_endpoint_features_2))
+    # temp_diff = 0
+    for i in range(loop_length):
+        temp_diff = ((abs(abs(sorted_node_features_1[i][1]) - abs(sorted_node_features_2[i][1])))\
+        /(max(abs(sorted_node_features_1[i][1]),abs(sorted_node_features_2[i][1]))))
+        
+        point_wise_diff.append(temp_diff)
+       
+    
+    actual_diff_limit = d_thresh*max(point_wise_diff)
+    for i in range(loop_length):
+        if (point_wise_diff[i] >= (actual_diff_limit)):
+            dis_sim_nodes_1.append(sorted_node_features_1[i][0])
+            dis_sim_nodes_2.append(sorted_node_features_2[i][0])
+
+
+    
+    # print(loop_length)
+    print("Node_wise_difference", point_wise_diff)
+    # print("list 1 len",len(max_connected_node_identifier_1))
+    
+    #since unequal lists are compared, the uncompared nodes should represent the dissimilar region of the geometry
+    if (larger_list == 1) and (len(max_connected_node_identifier_1) != len(max_connected_node_identifier_2)):
+        for i in range(loop_length-1, len(max_connected_node_identifier_1)):
+            dis_sim_nodes_1.append(sorted_node_features_1[i][0])
+            
+    if (larger_list == 2) and (len(max_connected_node_identifier_1) != len(max_connected_node_identifier_2)):
+        for i in range(loop_length-1, len(max_connected_node_identifier_2) ):
+            dis_sim_nodes_2.append(sorted_node_features_2[i][0])
+    
+    print("Dissimilar nodes:")
+    print(len(dis_sim_nodes_1))
+    print(len(dis_sim_nodes_2))
+    
+#     print("pointwise dissilimarity",(point_wise_diff))
+    
+    #for capturing the difference in the number of graph endpoints extracted from the two geometries
+    # endpoint_num_diff = (abs(len(endpoint_dict_1) - len(endpoint_dict_2))) / (max(len(endpoint_dict_1),len(endpoint_dict_2)))
+  
+    #for capturing the difference in the number of graph endpoints extracted from the two geometries
+    node_num_diff = (abs(len(max_connected_node_identifier_1) - len(max_connected_node_identifier_2)))\
+    /(max(len(max_connected_node_identifier_1),len(max_connected_node_identifier_2)))
+  
+    
+    #total dissimilarity measure for whole geometry
+    # phi_geometry = sum(point_wise_diff) / len(point_wise_diff)
+    # print("Feature Dissimilarity:", phi_geometry)
+    # phi_geometry = phi_geometry + endpoint_num_diff
+    # print("Node num dissimilarity:", endpoint_num_diff)
+    
+    
+    #total dissimilarity measure for whole geometry
+    phi_geometry = sum(point_wise_diff) / len(point_wise_diff)
+    print("Feature Dissimilarity:", phi_geometry)
+    phi_geometry = phi_geometry + node_num_diff
+    print("Node num dissimilarity:", node_num_diff)
+    
+    #total similarity
+    phi_geometry = (2-phi_geometry)/2
+#     print("Geometrical Dissimilarity: ", phi_geometry)
+
+    #plots
+    #dissimilar region plot
+    plot_dis_sim_nodes(vert_mat_1, max_subgraph_endpoints_1,max_connected_node_identifier_1,vert_mat_2,\
+    max_subgraph_endpoints_2,max_connected_node_identifier_2,abs(phi_geometry),dis_sim_nodes_1,dis_sim_nodes_2,d_thresh,\
+    point_arr_ID_1,node_set_ID_1,point_arr_ID_2,node_set_ID_2)
+    
+    #similarity plot
+    plot_two_geometries(vert_mat_1, max_subgraph_endpoints_1,max_connected_node_identifier_1,vert_mat_2,\
+    max_subgraph_endpoints_2,max_connected_node_identifier_2,abs(phi_geometry))
+    
+    return(abs(phi_geometry))
+
+
+
+    
+    
+#main function
+def main():
+    #returns similarity score and plots
+    similarity_index = similarity_score(file_1, lam_1, R_1, tau_1, file_2, lam_2, R_2, tau_2)
+    print("Similarity Score: ", similarity_index)
+    return()
+
+if __name__ == "__main__":
+    main()    
+    
+
